@@ -1,9 +1,9 @@
-```bash
 #!/bin/bash
 
 # Installation script for gcs-sync service
 # Usage: sudo ./gcs-sync-install.sh
 # Installs dependencies, sets up scripts, config, and systemd service
+# Resilient to existing Google Cloud SDK configurations and authentication issues
 
 set -e
 
@@ -15,6 +15,10 @@ LOG_DIR="/var/log/gcs-sync"
 SCRIPT_NAME="sync_to_gcs.sh"
 SERVICE_NAME="gcs-sync.service"
 CONFIG_NAME="config.conf"
+KEYRING_DIR="/usr/share/keyrings"
+GCS_KEYRING="$KEYRING_DIR/cloud.google.gpg"
+REPO_FILE="/etc/apt/sources.list.d/google-cloud-sdk.list"
+DEFAULT_CREDENTIALS="/etc/gcs/crackit-cloud.json"
 
 echo "Installing gcs-sync service..."
 
@@ -25,18 +29,81 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # Install dependencies
-echo "Installing dependencies (gsutil, gcloud)..."
+echo "Installing dependencies (curl, apt-transport-https, ca-certificates, gnupg)..."
 apt-get update
 apt-get install -y curl apt-transport-https ca-certificates gnupg
-curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
-echo "deb https://packages.cloud.google.com/apt cloud-sdk main" | tee -a /etc/apt/sources.list.d/google-cloud-sdk.list
+
+# Clean up existing Google Cloud SDK repository and keys
+echo "Cleaning up existing Google Cloud SDK repository configurations..."
+rm -f "$REPO_FILE"
+rm -f /etc/apt/keyrings/google-cloud-sdk.gpg
+find /etc/apt/sources.list.d/ -type f -exec sed -i '/packages.cloud.google.com/d' {} +
+find /etc/apt/sources.list -type f -exec sed -i '/packages.cloud.google.com/d' {} +
+
+# Add Google Cloud SDK repository
+if [ ! -f "$GCS_KEYRING" ]; then
+    mkdir -p "$KEYRING_DIR"
+    curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor > "$GCS_KEYRING"
+    chmod 644 "$GCS_KEYRING"
+fi
+echo "deb [signed-by=$GCS_KEYRING] https://packages.cloud.google.com/apt cloud-sdk main" | tee "$REPO_FILE"
+
+# Update and install Google Cloud SDK
 apt-get update
-apt-get install -y google-cloud-sdk
+if ! command -v gsutil &> /dev/null || ! command -v gcloud &> /dev/null; then
+    echo "Installing google-cloud-sdk..."
+    apt-get install -y google-cloud-sdk
+else
+    echo "Google Cloud SDK already installed, skipping installation."
+fi
 
 # Create directories
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR"
 chown www-data:www-data "$LOG_DIR"
 chmod 755 "$LOG_DIR"
+touch "$LOG_DIR/gcs-sync.log"
+chown www-data:www-data "$LOG_DIR/gcs-sync.log"
+chmod 664 "$LOG_DIR/gcs-sync.log"
+
+# Create writable directories for www-data
+mkdir -p /var/www/.config/gcloud
+mkdir -p /var/www/.cache/google-cloud-sdk
+mkdir -p /var/www/.gsutil
+chown -R www-data:www-data /var/www/.config /var/www/.cache /var/www/.gsutil
+chmod -R 700 /var/www/.config /var/www/.cache /var/www/.gsutil
+
+# Create gsutil config file
+sudo -u www-data bash -c 'echo "[Boto]" > /var/www/.gsutil/gsutil.cfg && echo "state_dir = /var/www/.gsutil" >> /var/www/.gsutil/gsutil.cfg'
+chown www-data:www-data /var/www/.gsutil/gsutil.cfg
+chmod 600 /var/www/.gsutil/gsutil.cfg
+
+# Prompt for credentials file and validate
+echo "Please provide the path to your GCS service account JSON key (default: $DEFAULT_CREDENTIALS):"
+read -r USER_CREDENTIALS_PATH
+USER_CREDENTIALS_PATH=${USER_CREDENTIALS_PATH:-$DEFAULT_CREDENTIALS}
+if [ -f "$USER_CREDENTIALS_PATH" ]; then
+    if grep -q '"type": "service_account"' "$USER_CREDENTIALS_PATH"; then
+        cp "$USER_CREDENTIALS_PATH" "$CONFIG_DIR/crackit-cloud.json"
+        chown www-data:www-data "$CONFIG_DIR/crackit-cloud.json"
+        chmod 600 "$CONFIG_DIR/crackit-cloud.json"
+    else
+        echo "Error: $USER_CREDENTIALS_PATH is not a valid service account JSON key"
+        exit 1
+    fi
+else
+    echo "Error: Credentials file $USER_CREDENTIALS_PATH not found"
+    exit 1
+fi
+
+# Test credentials as www-data
+echo "Testing credentials as www-data..."
+if ! sudo -u www-data bash -c "export GOOGLE_APPLICATION_CREDENTIALS=$CONFIG_DIR/crackit-cloud.json && export BOTO_CONFIG=/var/www/.gsutil/gsutil.cfg && /usr/bin/gsutil -o Credentials:gs_service_key_file=$CONFIG_DIR/crackit-cloud.json ls gs://crackit-technologies/playground/theuri/sync 2>/tmp/gcs-sync-test.log"; then
+    echo "Error: Authentication test failed for www-data. Check credentials and bucket permissions."
+    echo "Debug output in /tmp/gcs-sync-test.log"
+    cat /tmp/gcs-sync-test.log
+    echo "Run 'sudo -u www-data bash -c \"export GOOGLE_APPLICATION_CREDENTIALS=$CONFIG_DIR/crackit-cloud.json && export BOTO_CONFIG=/var/www/.gsutil/gsutil.cfg && /usr/bin/gsutil -o Credentials:gs_service_key_file=$CONFIG_DIR/crackit-cloud.json ls gs://crackit-technologies/playground/theuri/sync\"' to debug."
+    exit 1
+fi
 
 # Install sync_to_gcs.sh
 cat << 'EOF' > "$INSTALL_DIR/$SCRIPT_NAME"
@@ -111,13 +178,12 @@ fi
 
 # Set Google Cloud credentials
 export GOOGLE_APPLICATION_CREDENTIALS="$CREDENTIALS_PATH"
-gcloud auth activate-service-account --key-file="$CREDENTIALS_PATH" --quiet || {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Warning: gcloud auth failed, falling back to env var" >> "$LOG_FILE"
-}
+export BOTO_CONFIG="/var/www/.gsutil/gsutil.cfg"
+echo "$(date '+%Y-%m-%d %H:%M:%S') - Using credentials: $CREDENTIALS_PATH" >> "$LOG_FILE"
 
 # Test authentication
-if ! "$GSUTIL" ls gs://$(basename "$GCS_BUCKET") >/dev/null 2>&1; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Authentication failed - cannot list bucket" >> "$LOG_FILE"
+if ! "$GSUTIL" -o Credentials:gs_service_key_file="$CREDENTIALS_PATH" ls "$GCS_BUCKET" >/dev/null 2>>"$LOG_FILE"; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Error: Authentication failed - cannot list bucket $GCS_BUCKET" >> "$LOG_FILE"
     exit 1
 fi
 
@@ -126,9 +192,9 @@ sync_folder() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting sync from $LOCAL_PATH to $GCS_BUCKET" >> "$LOG_FILE"
     if [ "$DELETE" = true ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') - WARNING: Deleting files in $GCS_BUCKET not in $LOCAL_PATH" >> "$LOG_FILE"
-        "$GSUTIL" -m rsync -r -d "$LOCAL_PATH" "$GCS_BUCKET" >> "$LOG_FILE" 2>&1
+        "$GSUTIL" -m -o Credentials:gs_service_key_file="$CREDENTIALS_PATH" rsync -r -d "$LOCAL_PATH" "$GCS_BUCKET" >> "$LOG_FILE" 2>&1
     else
-        "$GSUTIL" -m rsync -r "$LOCAL_PATH" "$GCS_BUCKET" >> "$LOG_FILE" 2>&1
+        "$GSUTIL" -m -o Credentials:gs_service_key_file="$CREDENTIALS_PATH" rsync -r "$LOCAL_PATH" "$GCS_BUCKET" >> "$LOG_FILE" 2>&1
     fi
     if [ $? -eq 0 ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') - Sync completed successfully" >> "$LOG_FILE"
@@ -160,19 +226,7 @@ CREDENTIALS_PATH="/etc/gcs-sync/crackit-cloud.json"
 # Add more defaults here if needed
 EOF
 
-# Prompt for credentials file
-echo "Please provide the path to your GCS service account JSON key (e.g., /path/to/crackit-cloud.json):"
-read -r USER_CREDENTIALS_PATH
-if [ -f "$USER_CREDENTIALS_PATH" ]; then
-    cp "$USER_CREDENTIALS_PATH" "$CONFIG_DIR/crackit-cloud.json"
-    chown www-data:www-data "$CONFIG_DIR/crackit-cloud.json"
-    chmod 600 "$CONFIG_DIR/crackit-cloud.json"
-else
-    echo "Error: Credentials file $USER_CREDENTIALS_PATH not found"
-    exit 1
-fi
-
-# Install systemd service
+# Install systemd service with updated paths
 cat << EOF > "$SERVICE_DIR/$SERVICE_NAME"
 [Unit]
 Description=Google Cloud Storage Sync Service
@@ -182,10 +236,16 @@ After=network.target
 Type=simple
 User=www-data
 Group=www-data
-ExecStart=/usr/local/bin/sync_to_gcs.sh --local-path /var/www/html/client/forms --gcs-bucket gs://crackit-technologies
+WorkingDirectory=/var/www/html/cloud
+ExecStart=/usr/local/bin/sync_to_gcs.sh --local-path /var/www/html/cloud/test --gcs-bucket gs://crackit-technologies/playground/theuri/sync
 Restart=always
 RestartSec=10
 Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="GOOGLE_APPLICATION_CREDENTIALS=/etc/gcs-sync/crackit-cloud.json"
+Environment="BOTO_CONFIG=/var/www/.gsutil/gsutil.cfg"
+ProtectHome=false
+ProtectSystem=false
+PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target

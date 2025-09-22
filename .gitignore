@@ -1,0 +1,4 @@
+# Ignore sensitive files
+crackit-cloud.json
+*.log
+/etc/gcs-sync/
